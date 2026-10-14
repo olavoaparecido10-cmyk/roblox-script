@@ -1,942 +1,668 @@
---[[
-================================================================================
- UNIVERSAL MOVEMENT HUB  ·  v2.0.0  ·  Luau / Roblox
- Reescrito para compatibilidade máxima (Delta, Xeno, Solara, Wave, etc.)
-================================================================================
-]]
+-- ===== ARQUIVO: Config (ModuleScript em ReplicatedStorage > DebugTools) =====
+--!strict
+return table.freeze({
+	REMOTE_NAME = "DebugToolsEvent",
+	AUTH_ATTR = "DbgAuthorized",
+	ATTR_PREFIX = "Dbg_",
 
---================================================================================
--- [0] LOG DE INICIALIZAÇÃO
---================================================================================
-local function log(msg)
-	print("[UMH] " .. tostring(msg))
-end
+	Features = table.freeze({ "Fly", "Speed", "Noclip", "InfiniteJump" }),
 
-log("Iniciando Universal Movement Hub v2.0...")
+	Limits = table.freeze({
+		Speed = table.freeze({ Min = 0, Max = 120, Default = 40 }),
+		Fly = table.freeze({ Min = 0, Max = 200, Default = 60 }),
+	}),
+})
 
---================================================================================
--- [1] SERVIÇOS (com proteção contra falha)
---================================================================================
-local Players, RunService, UserInputService, TweenService, Lighting
-local LocalPlayer
+-- ===== ARQUIVO: DebugToolsServer (Script em ServerScriptService) =====
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
-local ok, err = pcall(function()
-	Players          = game:GetService("Players")
-	RunService       = game:GetService("RunService")
-	UserInputService = game:GetService("UserInputService")
-	TweenService     = game:GetService("TweenService")
-	Lighting         = game:GetService("Lighting")
-	LocalPlayer      = Players.LocalPlayer
-end)
+local Config = require(ReplicatedStorage:WaitForChild("DebugTools"):WaitForChild("Config"))
 
-if not ok then
-	warn("[UMH] Falha ao obter serviços: " .. tostring(err))
-	return
-end
-
---================================================================================
--- [2] AMBIENTE GLOBAL (fallback seguro para executores sem getgenv)
---================================================================================
-local ENV
-if typeof(getgenv) == "function" then
-	local ok2, g = pcall(getgenv)
-	ENV = (ok2 and g) or _G
-else
-	ENV = _G
-end
-
--- Limpa instância anterior
-if ENV.UMH_Loaded then
-	pcall(function() ENV.UMH_Loaded:Destroy() end)
-	ENV.UMH_Loaded = nil
-end
-
---================================================================================
--- [3] CONFIGURAÇÃO
---================================================================================
-ENV.UMH_Config = ENV.UMH_Config or {
-	Speed        = { Enabled = false, Value = 60,  Min = 16,  Max = 500 },
-	Fly          = { Enabled = false, Value = 80,  Min = 10,  Max = 1000 },
-	Noclip       = { Enabled = false },
-	InfiniteJump = { Enabled = false },
+local ADMIN_USER_IDS: { [number]: boolean } = {
+	-- [123456789] = true,
 }
 
-local Config = ENV.UMH_Config
+local MIN_REQUEST_INTERVAL = 0.05
 
---================================================================================
--- [4] UTILITÁRIOS
---================================================================================
-local Util = {}
+local remote = Instance.new("RemoteEvent")
+remote.Name = Config.REMOTE_NAME
+remote.Parent = ReplicatedStorage
 
-function Util.New(class, props)
-	local inst = Instance.new(class)
-	local parent
-	for k, v in pairs(props) do
-		if k == "Parent" then parent = v else inst[k] = v end
+local validFeatures: { [string]: boolean } = {}
+for _, feature in Config.Features do
+	validFeatures[feature] = true
+end
+
+local lastRequest: { [Player]: number } = {}
+
+local function isAuthorized(player: Player): boolean
+	if RunService:IsStudio() then
+		return true
 	end
-	if parent then inst.Parent = parent end
-	return inst
-end
-
-function Util.GetUIParent()
-	-- Tenta gethui primeiro (executor)
-	if typeof(gethui) == "function" then
-		local ok2, hui = pcall(gethui)
-		if ok2 and hui then return hui end
+	if game.CreatorType == Enum.CreatorType.User and player.UserId == game.CreatorId then
+		return true
 	end
-	-- Fallback: PlayerGui (funciona em todos)
-	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-	if pg then return pg end
-	return LocalPlayer:WaitForChild("PlayerGui", 10)
+	return ADMIN_USER_IDS[player.UserId] == true
 end
 
-function Util.Tween(inst, props, time, style, dir)
-	local info = TweenInfo.new(
-		time or 0.22,
-		style or Enum.EasingStyle.Quad,
-		dir or Enum.EasingDirection.Out
-	)
-	local t = TweenService:Create(inst, info, props)
-	t:Play()
-	return t
-end
-
-function Util.GetChar()
-	local char = LocalPlayer.Character
-	if not char or not char.Parent then return nil end
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	local hrp = char:FindFirstChild("HumanoidRootPart")
-	if not hum or not hrp then return nil end
-	if hum.Health <= 0 then return nil end
-	return hum, hrp, char
-end
-
---================================================================================
--- [5] TEMA
---================================================================================
-local T = {
-	Bg      = Color3.fromRGB(16, 18, 26),
-	Surface = Color3.fromRGB(26, 29, 40),
-	Field   = Color3.fromRGB(38, 42, 56),
-	Accent  = Color3.fromRGB(0, 200, 255),
-	Accent2 = Color3.fromRGB(150, 80, 255),
-	Green   = Color3.fromRGB(0, 230, 150),
-	Red     = Color3.fromRGB(255, 80, 100),
-	Text    = Color3.fromRGB(235, 240, 250),
-	Dim     = Color3.fromRGB(140, 148, 170),
-	White   = Color3.fromRGB(255, 255, 255),
-}
-
-local FONT = Enum.Font.Gotham
-local FONT_BOLD = Enum.Font.GothamBold
-
---================================================================================
--- [6] UI KIT
---================================================================================
-local UI = {}
-
-function UI.Section(parent, text, order)
-	local f = Util.New("Frame", {
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 24),
-		LayoutOrder = order or 0,
-		Parent = parent,
-	})
-	Util.New("TextLabel", {
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 1, 0),
-		Font = FONT_BOLD,
-		Text = string.upper(text),
-		TextColor3 = T.Dim,
-		TextSize = 11,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Parent = f,
-	})
-	return f
-end
-
-function UI.Toggle(parent, cfg)
-	local text = cfg.Text or "Toggle"
-	local cb = cfg.Callback or function() end
-	local state = cfg.Default and true or false
-
-	local holder = Util.New("Frame", {
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 34),
-		LayoutOrder = cfg.Order or 0,
-		Parent = parent,
-	})
-	Util.New("TextLabel", {
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, -60, 1, 0),
-		Font = FONT,
-		Text = text,
-		TextColor3 = T.Text,
-		TextSize = 14,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Parent = holder,
-	})
-	local track = Util.New("Frame", {
-		AnchorPoint = Vector2.new(1, 0.5),
-		Position = UDim2.new(1, 0, 0.5, 0),
-		Size = UDim2.new(0, 42, 0, 22),
-		BackgroundColor3 = T.Field,
-		BorderSizePixel = 0,
-		Parent = holder,
-	})
-	Util.New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = track })
-	Util.New("UIStroke", {
-		Color = T.White, Transparency = 0.85, Thickness = 1, Parent = track,
-	})
-	local knob = Util.New("Frame", {
-		AnchorPoint = Vector2.new(0, 0.5),
-		Position = UDim2.new(0, 3, 0.5, 0),
-		Size = UDim2.new(0, 16, 0, 16),
-		BackgroundColor3 = T.Dim,
-		BorderSizePixel = 0,
-		Parent = track,
-	})
-	Util.New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = knob })
-
-	local btn = Util.New("TextButton", {
-		Size = UDim2.new(1, 0, 1, 0),
-		BackgroundTransparency = 1,
-		Text = "",
-		Parent = holder,
-	})
-
-	local api = {}
-	function api:Set(v, silent)
-		state = v and true or false
-		Util.Tween(track, { BackgroundColor3 = state and T.Accent or T.Field }, 0.18)
-		Util.Tween(knob, {
-			Position = state and UDim2.new(0, 23, 0.5, 0) or UDim2.new(0, 3, 0.5, 0),
-			BackgroundColor3 = state and T.White or T.Dim,
-		}, 0.18)
-		if not silent then
-			local ok3, err3 = pcall(cb, state)
-			if not ok3 then warn("[UMH] Callback erro: " .. tostring(err3)) end
-		end
+local function onPlayerAdded(player: Player)
+	if isAuthorized(player) then
+		player:SetAttribute(Config.AUTH_ATTR, true)
 	end
-	function api:Get() return state end
-
-	btn.MouseButton1Click:Connect(function() api:Set(not state) end)
-	api:Set(state, true)
-	return api
 end
 
-function UI.NumberInput(parent, cfg)
-	local text = cfg.Text or "Valor"
-	local min, max = cfg.Min or 0, cfg.Max or 1000
-	local cb = cfg.Callback or function() end
-	local current = math.clamp(cfg.Default or 0, min, max)
-
-	local holder = Util.New("Frame", {
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 34),
-		LayoutOrder = cfg.Order or 0,
-		Parent = parent,
-	})
-	Util.New("TextLabel", {
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, -110, 1, 0),
-		Font = FONT,
-		Text = text,
-		TextColor3 = T.Text,
-		TextSize = 14,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Parent = holder,
-	})
-	local boxHolder = Util.New("Frame", {
-		AnchorPoint = Vector2.new(1, 0.5),
-		Position = UDim2.new(1, 0, 0.5, 0),
-		Size = UDim2.new(0, 96, 0, 26),
-		BackgroundColor3 = T.Field,
-		BorderSizePixel = 0,
-		Parent = holder,
-	})
-	Util.New("UICorner", { CornerRadius = UDim.new(0, 7), Parent = boxHolder })
-	local stroke = Util.New("UIStroke", {
-		Color = T.White, Transparency = 0.85, Thickness = 1, Parent = boxHolder,
-	})
-	local box = Util.New("TextBox", {
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, -12, 1, 0),
-		Position = UDim2.new(0, 6, 0, 0),
-		Font = FONT,
-		Text = tostring(current),
-		TextColor3 = T.Accent,
-		TextSize = 13,
-		TextXAlignment = Enum.TextXAlignment.Center,
-		ClearTextOnFocus = false,
-		Parent = boxHolder,
-	})
-
-	local api = {}
-	function api:Set(v, silent)
-		current = math.clamp(tonumber(v) or current, min, max)
-		box.Text = tostring(math.floor(current * 100 + 0.5) / 100)
-		if not silent then pcall(cb, current) end
-	end
-	function api:Get() return current end
-
-	box.FocusLost:Connect(function()
-		local n = tonumber(box.Text)
-		if n then api:Set(n) else box.Text = tostring(current) end
-	end)
-	return api
-end
-
-function UI.Button(parent, cfg)
-	local text = cfg.Text or "Btn"
-	local cb = cfg.Callback or function() end
-
-	local btn = Util.New("TextButton", {
-		Size = UDim2.new(1, 0, 0, 32),
-		BackgroundColor3 = T.Field,
-		BorderSizePixel = 0,
-		Font = FONT,
-		Text = text,
-		TextColor3 = T.Text,
-		TextSize = 13,
-		AutoButtonColor = false,
-		LayoutOrder = cfg.Order or 0,
-		Parent = parent,
-	})
-	Util.New("UICorner", { CornerRadius = UDim.new(0, 8), Parent = btn })
-	local stroke = Util.New("UIStroke", {
-		Color = T.White, Transparency = 0.85, Thickness = 1, Parent = btn,
-	})
-
-	btn.MouseEnter:Connect(function()
-		Util.Tween(btn, { BackgroundColor3 = T.Surface }, 0.15)
-		Util.Tween(stroke, { Color = T.Accent, Transparency = 0.4 }, 0.15)
-	end)
-	btn.MouseLeave:Connect(function()
-		Util.Tween(btn, { BackgroundColor3 = T.Field }, 0.15)
-		Util.Tween(stroke, { Color = T.White, Transparency = 0.85 }, 0.15)
-	end)
-	btn.MouseButton1Click:Connect(function()
-		local ok3, err3 = pcall(cb)
-		if not ok3 then warn("[UMH] Botão erro: " .. tostring(err3)) end
-	end)
-
-	return {
-		Instance = btn,
-		SetText = function(self, v) btn.Text = v end,
-	}
-end
-
-function UI.Label(parent, text, order, dim)
-	Util.New("TextLabel", {
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 18),
-		Font = FONT,
-		Text = text,
-		TextColor3 = dim and T.Dim or T.Text,
-		TextSize = 12,
-		TextWrapped = true,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		LayoutOrder = order or 0,
-		Parent = parent,
-	})
-end
-
---================================================================================
--- [7] HUD
---================================================================================
-local HUD = {}
-HUD.__index = HUD
-
-function HUD.new()
-	local self = setmetatable({}, HUD)
-	self.IsOpen = false
-	self.Tabs = {}
-	self:Build()
-	return self
-end
-
-function HUD:Build()
-	local uiParent = Util.GetUIParent()
-	if not uiParent then
-		warn("[UMH] Não foi possível obter parent de UI")
+remote.OnServerEvent:Connect(function(player, action, key, value)
+	if not isAuthorized(player) then
 		return
 	end
 
-	self.Gui = Util.New("ScreenGui", {
-		Name = "UMH_Hub",
-		ResetOnSpawn = false,
-		IgnoreGuiInset = true,
-		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-		DisplayOrder = 9999,
-		Parent = uiParent,
-	})
+	local now = os.clock()
+	if now - (lastRequest[player] or 0) < MIN_REQUEST_INTERVAL then
+		return
+	end
+	lastRequest[player] = now
 
-	-- Launcher
-	local launcher = Util.New("TextButton", {
-		AnchorPoint = Vector2.new(0, 0.5),
-		Position = UDim2.new(0, 8, 0.5, 0),
-		Size = UDim2.new(0, 44, 0, 44),
-		BackgroundColor3 = T.Accent,
-		BorderSizePixel = 0,
-		Text = "UMH",
-		Font = FONT_BOLD,
-		TextColor3 = Color3.fromRGB(10, 12, 18),
-		TextSize = 13,
-		AutoButtonColor = false,
-		Parent = self.Gui,
-	})
-	Util.New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = launcher })
-	Util.New("UIStroke", {
-		Color = T.White, Transparency = 0.7, Thickness = 1.5, Parent = launcher,
-	})
-	self.Launcher = launcher
+	if type(action) ~= "string" or type(key) ~= "string" then
+		return
+	end
 
-	-- Painel
-	local W, H = 560, 420
-	local CLOSED = UDim2.new(0, -(W + 40), 0.5, 0)
-	local OPEN = UDim2.new(0, 24, 0.5, 0)
+	if action == "Toggle" then
+		if validFeatures[key] and type(value) == "boolean" then
+			player:SetAttribute(Config.ATTR_PREFIX .. key, value)
+		end
+	elseif action == "SetValue" then
+		local limits = Config.Limits[key]
+		if limits and type(value) == "number" and value == value then
+			player:SetAttribute(Config.ATTR_PREFIX .. key .. "Value", math.clamp(value, limits.Min, limits.Max))
+		end
+	end
+end)
 
-	local panel = Util.New("Frame", {
-		AnchorPoint = Vector2.new(0, 0.5),
-		Position = CLOSED,
-		Size = UDim2.new(0, W, 0, H),
-		BackgroundColor3 = T.Bg,
-		BackgroundTransparency = 0.1,
-		BorderSizePixel = 0,
-		ClipsDescendants = true,
-		Parent = self.Gui,
-	})
-	self.Panel = panel
-	self.ClosedPos = CLOSED
-	self.OpenPos = OPEN
-	Util.New("UICorner", { CornerRadius = UDim.new(0, 14), Parent = panel })
-	Util.New("UIStroke", {
-		Color = T.White, Transparency = 0.82, Thickness = 1.5, Parent = panel,
-	})
-
-	-- Sidebar
-	local sidebar = Util.New("Frame", {
-		Size = UDim2.new(0, 150, 1, 0),
-		BackgroundColor3 = T.Surface,
-		BackgroundTransparency = 0.3,
-		BorderSizePixel = 0,
-		Parent = panel,
-	})
-	Util.New("TextLabel", {
-		BackgroundTransparency = 1,
-		Position = UDim2.new(0, 18, 0, 22),
-		Size = UDim2.new(1, -18, 0, 24),
-		Font = FONT_BOLD,
-		Text = "UMH",
-		TextColor3 = T.Text,
-		TextSize = 22,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Parent = sidebar,
-	})
-	Util.New("TextLabel", {
-		BackgroundTransparency = 1,
-		Position = UDim2.new(0, 18, 0, 46),
-		Size = UDim2.new(1, -18, 0, 16),
-		Font = FONT,
-		Text = "v2.0.0 · universal",
-		TextColor3 = T.Accent,
-		TextSize = 11,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Parent = sidebar,
-	})
-
-	local tabHolder = Util.New("Frame", {
-		Position = UDim2.new(0, 0, 0, 84),
-		Size = UDim2.new(1, 0, 1, -84),
-		BackgroundTransparency = 1,
-		Parent = sidebar,
-	})
-	Util.New("UIListLayout", {
-		Padding = UDim.new(0, 4),
-		SortOrder = Enum.SortOrder.LayoutOrder,
-		Parent = tabHolder,
-	})
-	Util.New("UIPadding", {
-		PaddingLeft = UDim.new(0, 10),
-		PaddingRight = UDim.new(0, 10),
-		Parent = tabHolder,
-	})
-	self.TabHolder = tabHolder
-
-	-- Conteúdo
-	local content = Util.New("Frame", {
-		Position = UDim2.new(0, 150, 0, 0),
-		Size = UDim2.new(1, -150, 1, 0),
-		BackgroundTransparency = 1,
-		Parent = panel,
-	})
-	self.HeaderTitle = Util.New("TextLabel", {
-		BackgroundTransparency = 1,
-		Position = UDim2.new(0, 18, 0, 0),
-		Size = UDim2.new(1, -80, 0, 46),
-		Font = FONT_BOLD,
-		Text = "Movimentação",
-		TextColor3 = T.Text,
-		TextSize = 16,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Parent = content,
-	})
-
-	-- Close
-	local closeBtn = Util.New("TextButton", {
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -14, 0, 10),
-		Size = UDim2.new(0, 26, 0, 26),
-		BackgroundColor3 = T.Field,
-		BorderSizePixel = 0,
-		Text = "×",
-		Font = FONT_BOLD,
-		TextColor3 = T.Dim,
-		TextSize = 18,
-		AutoButtonColor = false,
-		Parent = content,
-	})
-	Util.New("UICorner", { CornerRadius = UDim.new(0, 8), Parent = closeBtn })
-	closeBtn.MouseButton1Click:Connect(function() self:Close() end)
-
-	self.PageContainer = Util.New("Frame", {
-		Position = UDim2.new(0, 0, 0, 46),
-		Size = UDim2.new(1, 0, 1, -46),
-		BackgroundTransparency = 1,
-		Parent = content,
-	})
-
-	launcher.MouseButton1Click:Connect(function() self:Open() end)
-
-	-- Cria abas
-	self:AddTab("Movimentação", 1)
-	self:AddTab("Utilidades",   2)
-	self:AddTab("Configurações",3)
-	self:AddTab("Créditos",     4)
-
-	self:SelectTab(1)
-	log("HUD construída com sucesso.")
+Players.PlayerAdded:Connect(onPlayerAdded)
+for _, player in Players:GetPlayers() do
+	onPlayerAdded(player)
 end
 
-function HUD:AddTab(name, order)
-	local btn = Util.New("TextButton", {
-		Size = UDim2.new(1, 0, 0, 34),
-		BackgroundColor3 = T.Surface,
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		Font = FONT,
-		Text = "   " .. name,
-		TextColor3 = T.Dim,
-		TextSize = 13,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		AutoButtonColor = false,
-		LayoutOrder = order,
-		Parent = self.TabHolder,
-	})
-	Util.New("UICorner", { CornerRadius = UDim.new(0, 8), Parent = btn })
+Players.PlayerRemoving:Connect(function(player)
+	lastRequest[player] = nil
+end)
 
-	local ind = Util.New("Frame", {
-		AnchorPoint = Vector2.new(0, 0.5),
-		Position = UDim2.new(0, 0, 0.5, 0),
-		Size = UDim2.new(0, 0, 0, 16),
-		BackgroundColor3 = T.Accent,
-		BorderSizePixel = 0,
-		Parent = btn,
-	})
-	Util.New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = ind })
+-- ===== ARQUIVO: DebugToolsClient (LocalScript em StarterPlayerScripts) =====
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
 
-	local page = Util.New("ScrollingFrame", {
-		Size = UDim2.new(1, 0, 1, 0),
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		ScrollBarThickness = 3,
-		ScrollBarImageColor3 = T.Accent,
-		CanvasSize = UDim2.new(0, 0, 0, 0),
-		AutomaticCanvasSize = Enum.AutomaticSize.Y,
-		Visible = false,
-		Parent = self.PageContainer,
-	})
-	Util.New("UIListLayout", {
-		Padding = UDim.new(0, 8),
-		SortOrder = Enum.SortOrder.LayoutOrder,
-		Parent = page,
-	})
-	Util.New("UIPadding", {
-		PaddingLeft = UDim.new(0, 18),
-		PaddingRight = UDim.new(0, 18),
-		PaddingTop = UDim.new(0, 4),
-		PaddingBottom = UDim.new(0, 20),
-		Parent = page,
-	})
+local player = Players.LocalPlayer
 
-	local tab = { Name = name, Button = btn, Page = page, Ind = ind, Order = order }
-	table.insert(self.Tabs, tab)
+local DebugTools = ReplicatedStorage:WaitForChild("DebugTools")
+local Config = require(DebugTools:WaitForChild("Config"))
+local remote = ReplicatedStorage:WaitForChild(Config.REMOTE_NAME) :: RemoteEvent
 
-	btn.MouseButton1Click:Connect(function() self:SelectTab(order) end)
-	return tab
-end
+local HUD = require(script:WaitForChild("HUD"))
+local Movement = require(script:WaitForChild("Movement"))
 
-function HUD:SelectTab(order)
-	for _, tab in ipairs(self.Tabs) do
-		local active = (tab.Order == order)
-		tab.Page.Visible = active
-		Util.Tween(tab.Button, {
-			BackgroundTransparency = active and 0.55 or 1,
-			TextColor3 = active and T.Text or T.Dim,
-		}, 0.18)
-		Util.Tween(tab.Ind, {
-			Size = active and UDim2.new(0, 3, 0, 16) or UDim2.new(0, 0, 0, 16),
-		}, 0.2)
-		if active then self.HeaderTitle.Text = tab.Name end
+if player:GetAttribute(Config.AUTH_ATTR) ~= true then
+	player:GetAttributeChangedSignal(Config.AUTH_ATTR):Wait()
+	if player:GetAttribute(Config.AUTH_ATTR) ~= true then
+		return
 	end
 end
 
-function HUD:Open()
-	if self.IsOpen then return end
-	self.IsOpen = true
-	self.Launcher.Visible = false
-	Util.Tween(self.Panel, { Position = self.OpenPos }, 0.4, Enum.EasingStyle.Quint)
+local prefix = Config.ATTR_PREFIX
+
+local movement = Movement.new({
+	Speed = Config.Limits.Speed.Default,
+	Fly = Config.Limits.Fly.Default,
+})
+
+local hud = HUD.new(Config, {
+	onToggle = function(feature: string, state: boolean)
+		remote:FireServer("Toggle", feature, state)
+	end,
+	onValue = function(key: string, value: number)
+		remote:FireServer("SetValue", key, value)
+	end,
+})
+
+local function applyFeature(feature: string)
+	local on = player:GetAttribute(prefix .. feature) == true
+	movement:SetEnabled(feature, on)
+	hud:SetToggle(feature, on)
 end
 
-function HUD:Close()
-	if not self.IsOpen then return end
-	self.IsOpen = false
-	Util.Tween(self.Panel, { Position = self.ClosedPos }, 0.32, Enum.EasingStyle.Quint)
-	task.delay(0.32, function()
-		if not self.IsOpen then self.Launcher.Visible = true end
+local function applyValue(key: string)
+	local value = player:GetAttribute(prefix .. key .. "Value")
+	if type(value) ~= "number" then
+		value = Config.Limits[key].Default
+	end
+	movement:SetValue(key, value)
+	hud:SetValue(key, value)
+end
+
+for _, feature in Config.Features do
+	player:GetAttributeChangedSignal(prefix .. feature):Connect(function()
+		applyFeature(feature)
 	end)
+	applyFeature(feature)
 end
 
-function HUD:Toggle()
-	if self.IsOpen then self:Close() else self:Open() end
+for key in Config.Limits do
+	player:GetAttributeChangedSignal(prefix .. key .. "Value"):Connect(function()
+		applyValue(key)
+	end)
+	applyValue(key)
+end
+
+if player.Character then
+	task.spawn(movement.Bind, movement, player.Character)
+end
+player.CharacterAdded:Connect(function(character)
+	movement:Bind(character)
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if not gameProcessed and input.KeyCode == Enum.KeyCode.F4 then
+		hud:ToggleVisible()
+	end
+end)
+
+-- ===== ARQUIVO: HUD (ModuleScript, filho de DebugToolsClient) =====
+local Players = game:GetService("Players")
+
+local HUD = {}
+HUD.__index = HUD
+
+local COLORS = {
+	Panel = Color3.fromRGB(32, 34, 38),
+	Row = Color3.fromRGB(44, 47, 53),
+	Stroke = Color3.fromRGB(66, 70, 78),
+	Text = Color3.fromRGB(228, 230, 234),
+	Muted = Color3.fromRGB(145, 150, 159),
+	On = Color3.fromRGB(64, 160, 110),
+	Off = Color3.fromRGB(78, 82, 90),
+}
+
+local FEATURE_LABELS = {
+	Fly = "Voo",
+	Speed = "Super-velocidade",
+	Noclip = "Modo espectador",
+	InfiniteJump = "Pulo repetitivo",
+}
+
+local VALUE_LABELS = {
+	Fly = "Força de voo",
+	Speed = "Velocidade extra",
+}
+
+local function formatNumber(n: number): string
+	return string.format("%g", n)
+end
+
+local function addCorner(instance: Instance, radius: number)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, radius)
+	corner.Parent = instance
+end
+
+local function addStroke(instance: Instance)
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = COLORS.Stroke
+	stroke.Thickness = 1
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = instance
+end
+
+local function newLabel(parent: Instance, text: string, font: Enum.Font, size: number, color: Color3, order: number)
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.new(1, 0, 0, size + 6)
+	label.Font = font
+	label.Text = text
+	label.TextSize = size
+	label.TextColor3 = color
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.LayoutOrder = order
+	label.Parent = parent
+	return label
+end
+
+local function newRow(parent: Instance, order: number, text: string): Frame
+	local row = Instance.new("Frame")
+	row.Size = UDim2.new(1, 0, 0, 36)
+	row.BackgroundColor3 = COLORS.Row
+	row.BorderSizePixel = 0
+	row.LayoutOrder = order
+	row.Parent = parent
+	addCorner(row, 6)
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingLeft = UDim.new(0, 10)
+	padding.PaddingRight = UDim.new(0, 5)
+	padding.Parent = row
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.new(1, -80, 1, 0)
+	label.Font = Enum.Font.Gotham
+	label.Text = text
+	label.TextSize = 13
+	label.TextColor3 = COLORS.Text
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = row
+
+	return row
+end
+
+function HUD.new(config, callbacks)
+	local self = setmetatable({}, HUD)
+	self._values = {}
+	self._toggles = {}
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "DebugToolsHUD"
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 100
+	gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+	self._gui = gui
+
+	local panel = Instance.new("Frame")
+	panel.Name = "Panel"
+	panel.AnchorPoint = Vector2.new(0, 0.5)
+	panel.Position = UDim2.new(0, 16, 0.5, 0)
+	panel.Size = UDim2.fromOffset(264, 0)
+	panel.AutomaticSize = Enum.AutomaticSize.Y
+	panel.BackgroundColor3 = COLORS.Panel
+	panel.BorderSizePixel = 0
+	panel.Parent = gui
+	addCorner(panel, 10)
+	addStroke(panel)
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, 12)
+	padding.PaddingBottom = UDim.new(0, 12)
+	padding.PaddingLeft = UDim.new(0, 12)
+	padding.PaddingRight = UDim.new(0, 12)
+	padding.Parent = panel
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 6)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = panel
+
+	newLabel(panel, "CONTROLE DE MOVIMENTO", Enum.Font.GothamBold, 14, COLORS.Text, 1)
+	newLabel(panel, "Ferramentas de teste", Enum.Font.Gotham, 11, COLORS.Muted, 2)
+	newLabel(panel, "PARÂMETROS", Enum.Font.GothamBold, 11, COLORS.Muted, 3)
+
+	for i, key in { "Fly", "Speed" } do
+		local limits = config.Limits[key]
+		local row = newRow(panel, 3 + i, VALUE_LABELS[key])
+
+		local box = Instance.new("TextBox")
+		box.AnchorPoint = Vector2.new(1, 0.5)
+		box.Position = UDim2.new(1, 0, 0.5, 0)
+		box.Size = UDim2.fromOffset(64, 26)
+		box.BackgroundColor3 = COLORS.Panel
+		box.BorderSizePixel = 0
+		box.Font = Enum.Font.Gotham
+		box.TextSize = 13
+		box.TextColor3 = COLORS.Text
+		box.ClearTextOnFocus = false
+		box.Text = formatNumber(limits.Default)
+		box.Parent = row
+		addCorner(box, 5)
+		addStroke(box)
+
+		self._values[key] = { value = limits.Default, box = box }
+
+		box.FocusLost:Connect(function()
+			local entry = self._values[key]
+			local number = tonumber(box.Text)
+			if number == nil or number ~= number then
+				box.Text = formatNumber(entry.value)
+				return
+			end
+			number = math.clamp(number, limits.Min, limits.Max)
+			entry.value = number
+			box.Text = formatNumber(number)
+			callbacks.onValue(key, number)
+		end)
+	end
+
+	newLabel(panel, "MÓDULOS", Enum.Font.GothamBold, 11, COLORS.Muted, 6)
+
+	for i, feature in config.Features do
+		local row = newRow(panel, 6 + i, FEATURE_LABELS[feature])
+
+		local button = Instance.new("TextButton")
+		button.AnchorPoint = Vector2.new(1, 0.5)
+		button.Position = UDim2.new(1, 0, 0.5, 0)
+		button.Size = UDim2.fromOffset(56, 26)
+		button.AutoButtonColor = false
+		button.BorderSizePixel = 0
+		button.Font = Enum.Font.GothamBold
+		button.TextSize = 12
+		button.TextColor3 = COLORS.Text
+		button.Parent = row
+		addCorner(button, 5)
+
+		self._toggles[feature] = { button = button, state = false }
+		self:SetToggle(feature, false)
+
+		button.Activated:Connect(function()
+			callbacks.onToggle(feature, not self._toggles[feature].state)
+		end)
+	end
+
+	local hint = newLabel(panel, "Voo: WASD + Espaço (sobe) / Ctrl (desce)\nF4 oculta o painel", Enum.Font.Gotham, 11, COLORS.Muted, 20)
+	hint.TextWrapped = true
+	hint.AutomaticSize = Enum.AutomaticSize.Y
+	hint.Size = UDim2.new(1, 0, 0, 0)
+
+	return self
+end
+
+function HUD:SetToggle(feature: string, state: boolean)
+	local entry = self._toggles[feature]
+	if not entry then
+		return
+	end
+	entry.state = state
+	entry.button.Text = state and "ON" or "OFF"
+	entry.button.BackgroundColor3 = state and COLORS.On or COLORS.Off
+end
+
+function HUD:SetValue(key: string, value: number)
+	local entry = self._values[key]
+	if not entry then
+		return
+	end
+	entry.value = value
+	entry.box.Text = formatNumber(value)
+end
+
+function HUD:ToggleVisible()
+	self._gui.Enabled = not self._gui.Enabled
 end
 
 function HUD:Destroy()
-	pcall(function() self.Gui:Destroy() end)
+	self._gui:Destroy()
 end
 
---================================================================================
--- [8] MOTORES DE MOVIMENTO
---================================================================================
+return HUD
 
--- SPEED (CFrame Glide)
-local Speed = { Original = 16, Active = false }
+-- ===== ARQUIVO: Movement (ModuleScript, filho de DebugToolsClient) =====
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 
-function Speed:SetState(state)
-	local hum = Util.GetChar()
-	if state then
-		if hum then
-			self.Original = hum.WalkSpeed
-			hum.WalkSpeed = 0
+local Movement = {}
+Movement.__index = Movement
+
+local FLY_SMOOTHING = 8
+local SLIDE_SMOOTHING = 10
+
+function Movement.new(defaults: { Speed: number, Fly: number })
+	local self = setmetatable({}, Movement)
+
+	self.enabled = { Fly = false, Speed = false, Noclip = false, InfiniteJump = false }
+	self.values = { Speed = defaults.Speed, Fly = defaults.Fly }
+
+	self.character = nil :: Model?
+	self.humanoid = nil :: Humanoid?
+	self.root = nil :: BasePart?
+
+	self._flyObjects = nil :: { attachment: Attachment, velocity: LinearVelocity, align: AlignOrientation }?
+	self._flyVelocity = Vector3.zero
+	self._slide = Vector3.zero
+	self._prevAutoRotate = true
+	self._originalCollide = {} :: { [BasePart]: boolean }
+	self._connections = {} :: { RBXScriptConnection }
+
+	self._jumpConnection = UserInputService.JumpRequest:Connect(function()
+		local humanoid = self.humanoid
+		if self.enabled.InfiniteJump and humanoid and humanoid.Health > 0 then
+			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 		end
-		self.Active = true
-	else
-		self.Active = false
-		local hum2 = Util.GetChar()
-		if hum2 then hum2.WalkSpeed = self.Original > 0 and self.Original or 16 end
-	end
+	end)
+
+	return self
 end
 
-function Speed:Update(dt)
-	if not Config.Speed.Enabled then return end
-	local hum, hrp = Util.GetChar()
-	if not hum or not hrp then return end
+function Movement:Bind(character: Model)
+	self:_unbindCharacter()
 
-	local cam = workspace.CurrentCamera
-	if not cam then return end
+	local humanoid = character:WaitForChild("Humanoid") :: Humanoid
+	local root = character:WaitForChild("HumanoidRootPart") :: BasePart
+	self.character, self.humanoid, self.root = character, humanoid, root
 
-	local dir = hum.MoveDirection
-	if dir.Magnitude < 0.05 then
-		local move = Vector3.zero
-		if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += cam.CFrame.LookVector end
-		if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= cam.CFrame.LookVector end
-		if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= cam.CFrame.RightVector end
-		if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += cam.CFrame.RightVector end
-		move = Vector3.new(move.X, 0, move.Z)
-		if move.Magnitude > 0.01 then dir = move.Unit end
-	end
-
-	if dir.Magnitude < 0.05 then return end
-	if hum.WalkSpeed ~= 0 then hum.WalkSpeed = 0 end
-	hrp.CFrame = hrp.CFrame + dir.Unit * Config.Speed.Value * dt
-end
-
--- FLY (VectorForce + BodyGyro)
-local Fly = { Force = nil, Gyro = nil, Attach = nil, Active = false, Saved = nil }
-
-function Fly:Build(hrp)
-	self:Destroy()
-	local att = Util.New("Attachment", { Parent = hrp })
-	local force = Util.New("VectorForce", {
-		Attachment0 = att,
-		ApplyAtCenterOfMass = true,
-		RelativeTo = Enum.ActuatorRelativeTo.World,
-		Force = Vector3.zero,
-		Parent = hrp,
-	})
-	local gyro = Util.New("BodyGyro", {
-		CFrame = hrp.CFrame,
-		MaxTorque = Vector3.new(1e6, 1e6, 1e6),
-		P = 3000,
-		D = 500,
-		Parent = hrp,
-	})
-	self.Attach, self.Force, self.Gyro = att, force, gyro
-end
-
-function Fly:Destroy()
-	for _, inst in ipairs({ self.Force, self.Gyro, self.Attach }) do
-		if inst then pcall(function() inst:Destroy() end) end
-	end
-	self.Force, self.Gyro, self.Attach = nil, nil, nil
-end
-
-function Fly:SetState(state)
-	if state == self.Active then return end
-	self.Active = state
-	local hum, hrp = Util.GetChar()
-	if not hum or not hrp then self.Active = false return end
-
-	if state then
-		hum.AutoRotate = false
-		hum.WalkSpeed = 0
-		self.Saved = {
-			Freefall = hum:GetStateEnabled(Enum.HumanoidStateType.Freefall),
-			Climbing = hum:GetStateEnabled(Enum.HumanoidStateType.Climbing),
-			Swimming = hum:GetStateEnabled(Enum.HumanoidStateType.Swimming),
-		}
-		hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
-		hum:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
-		hum:SetStateEnabled(Enum.HumanoidStateType.Swimming, false)
-		self:Build(hrp)
-	else
-		self:Destroy()
-		hum.AutoRotate = true
-		hum.WalkSpeed = 16
-		if self.Saved then
-			pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, self.Saved.Freefall) end)
-			pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Climbing, self.Saved.Climbing) end)
-			pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Swimming, self.Saved.Swimming) end)
-		end
-		self.Saved = nil
-	end
-end
-
-function Fly:Update(dt)
-	if not Config.Fly.Enabled then return end
-	local hum, hrp = Util.GetChar()
-	if not hum or not hrp then return end
-
-	if not self.Force or not self.Force.Parent then self:Build(hrp) end
-	local cam = workspace.CurrentCamera
-	if not cam then return end
-
-	local dir = Vector3.zero
-	if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir += cam.CFrame.LookVector end
-	if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir -= cam.CFrame.LookVector end
-	if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir -= cam.CFrame.RightVector end
-	if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir += cam.CFrame.RightVector end
-	if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.new(0, 1, 0) end
-	if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then dir -= Vector3.new(0, 1, 0) end
-	if dir.Magnitude > 0.01 then dir = dir.Unit end
-
-	local speed = Config.Fly.Value
-	local target = dir * speed
-	local mass = hrp.AssemblyMass
-	local curVel = hrp.AssemblyLinearVelocity
-	local delta = target - curVel
-	local gravityComp = Vector3.new(0, workspace.Gravity * mass, 0)
-	local force = gravityComp + (delta * mass * 14)
-
-	local maxF = mass * 100000
-	force = Vector3.new(
-		math.clamp(force.X, -maxF, maxF),
-		math.clamp(force.Y, -maxF, maxF),
-		math.clamp(force.Z, -maxF, maxF)
+	table.insert(
+		self._connections,
+		RunService.Heartbeat:Connect(function(dt)
+			self:_step(dt)
+		end)
 	)
-	self.Force.Force = force
-	self.Gyro.CFrame = cam.CFrame
+	table.insert(
+		self._connections,
+		RunService.Stepped:Connect(function()
+			self:_applyNoclip()
+		end)
+	)
 
-	pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
-end
-
--- NOCLIP
-local Noclip = {}
-function Noclip:Update()
-	if not Config.Noclip.Enabled then return end
-	local char = LocalPlayer.Character
-	if not char then return end
-	for _, p in ipairs(char:GetDescendants()) do
-		if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+	if self.enabled.Fly then
+		self:_startFlight()
 	end
 end
 
--- INFINITE JUMP
-local InfJump = { Deb = false }
-function InfJump:Init()
-	UserInputService.JumpRequest:Connect(function()
-		if not Config.InfiniteJump.Enabled then return end
-		if self.Deb then return end
-		self.Deb = true
-		task.delay(0.08, function() self.Deb = false end)
-		local hum = Util.GetChar()
-		if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end) end
-	end)
-end
+function Movement:SetEnabled(feature: string, on: boolean)
+	if self.enabled[feature] == nil or self.enabled[feature] == on then
+		return
+	end
+	self.enabled[feature] = on
 
---================================================================================
--- [9] BOOTSTRAP
---================================================================================
-log("Construindo HUD...")
-local hub = HUD.new()
-ENV.UMH_Loaded = hub
-
--- Aba: Movimentação
-local pMove = hub.Tabs[1].Page
-
-UI.Section(pMove, "Corrida", 1)
-UI.Toggle(pMove, {
-	Text = "Speed (CFrame Glide)",
-	Default = Config.Speed.Enabled,
-	Order = 2,
-	Callback = function(s)
-		Config.Speed.Enabled = s
-		Speed:SetState(s)
-		log("Speed: " .. tostring(s))
-	end,
-})
-local speedInput = UI.NumberInput(pMove, {
-	Text = "Velocidade de Corrida",
-	Default = Config.Speed.Value,
-	Min = Config.Speed.Min, Max = Config.Speed.Max,
-	Order = 3,
-	Callback = function(v) Config.Speed.Value = v end,
-})
-
-UI.Section(pMove, "Voo", 4)
-UI.Toggle(pMove, {
-	Text = "Fly (VectorForce)",
-	Default = Config.Fly.Enabled,
-	Order = 5,
-	Callback = function(s)
-		Config.Fly.Enabled = s
-		Fly:SetState(s)
-		log("Fly: " .. tostring(s))
-	end,
-})
-local flyInput = UI.NumberInput(pMove, {
-	Text = "Velocidade de Voo",
-	Default = Config.Fly.Value,
-	Min = Config.Fly.Min, Max = Config.Fly.Max,
-	Order = 6,
-	Callback = function(v) Config.Fly.Value = v end,
-})
-UI.Label(pMove, "WASD = direção · Space = subir · Ctrl = descer", 7, true)
-
--- Aba: Utilidades
-local pUtil = hub.Tabs[2].Page
-UI.Section(pUtil, "Mobilidade", 1)
-UI.Toggle(pUtil, {
-	Text = "Noclip",
-	Default = Config.Noclip.Enabled,
-	Order = 2,
-	Callback = function(s)
-		Config.Noclip.Enabled = s
-		if not s then
-			local char = LocalPlayer.Character
-			if char then
-				for _, p in ipairs(char:GetDescendants()) do
-					if p:IsA("BasePart") then p.CanCollide = true end
-				end
-			end
+	if feature == "Fly" then
+		if on then
+			self:_startFlight()
+		else
+			self:_stopFlight()
 		end
-	end,
-})
-UI.Toggle(pUtil, {
-	Text = "Infinite Jump",
-	Default = Config.InfiniteJump.Enabled,
-	Order = 3,
-	Callback = function(s) Config.InfiniteJump.Enabled = s end,
-})
-UI.Section(pUtil, "Info", 4)
-UI.Label(pUtil, "Anti-Lag: cada sistema em task.spawn separado.", 5, true)
-UI.Label(pUtil, "State Spoofing ativo durante o voo.", 6, true)
-
--- Aba: Configurações
-local pCfg = hub.Tabs[3].Page
-UI.Section(pCfg, "Reset", 1)
-UI.Button(pCfg, {
-	Text = "Restaurar Padrões",
-	Order = 2,
-	Callback = function()
-		speedInput:Set(60, true)
-		flyInput:Set(80, true)
-		Config.Speed.Value = 60
-		Config.Fly.Value = 80
-		log("Configurações restauradas.")
-	end,
-})
-
--- Aba: Créditos
-local pCred = hub.Tabs[4].Page
-UI.Section(pCred, "Universal Movement Hub", 1)
-UI.Label(pCred, "Versão 2.0.0", 2)
-UI.Label(pCred, "Arquitetura modular em Luau com motores independentes.", 3, true)
-UI.Section(pCred, "Stack", 4)
-UI.Label(pCred, "• Heartbeat → Speed / Fly", 5, true)
-UI.Label(pCred, "• Stepped → Noclip", 6, true)
-UI.Label(pCred, "• TweenService → HUD", 7, true)
-
---================================================================================
--- [10] LOOPS (isolados em task.spawn)
---================================================================================
-task.spawn(function()
-	RunService.Heartbeat:Connect(function(dt)
-		pcall(Speed.Update, Speed, dt)
-	end)
-end)
-
-task.spawn(function()
-	RunService.Heartbeat:Connect(function(dt)
-		pcall(Fly.Update, Fly, dt)
-	end)
-end)
-
-task.spawn(function()
-	RunService.Stepped:Connect(function()
-		pcall(Noclip.Update, Noclip)
-	end)
-end)
-
-task.spawn(function()
-	InfJump:Init()
-end)
-
--- Respawn handler
-LocalPlayer.CharacterAdded:Connect(function()
-	task.wait(0.6)
-	if Config.Fly.Enabled then
-		Fly.Active = false
-		Fly:SetState(true)
+	elseif feature == "Noclip" and not on then
+		self:_restoreCollisions()
 	end
-	if Config.Speed.Enabled then Speed:SetState(true) end
-end)
+end
 
--- Abre o menu
-task.delay(0.3, function() hub:Open() end)
+function Movement:SetValue(key: string, value: number)
+	if self.values[key] ~= nil then
+		self.values[key] = value
+	end
+end
 
---================================================================================
--- [11] API PÚBLICA
---================================================================================
-ENV.UMH = {
-	Version = "2.0.0",
-	Config  = Config,
-	Hub     = hub,
-	Speed   = Speed,
-	Fly     = Fly,
-	Noclip  = Noclip,
-	InfJump = InfJump,
-}
+function Movement:Destroy()
+	self._jumpConnection:Disconnect()
+	self:_unbindCharacter()
+end
 
-log("Universal Movement Hub v2.0 carregado com sucesso! ✅")
+function Movement:_unbindCharacter()
+	for _, connection in self._connections do
+		connection:Disconnect()
+	end
+	table.clear(self._connections)
+
+	self:_stopFlight()
+	table.clear(self._originalCollide)
+	self._slide = Vector3.zero
+	self.character, self.humanoid, self.root = nil, nil, nil
+end
+
+function Movement:_step(dt: number)
+	local humanoid, root = self.humanoid, self.root
+	if not humanoid or not root or humanoid.Health <= 0 or not root.Parent then
+		return
+	end
+
+	if self._flyObjects then
+		self:_stepFlight(dt, humanoid)
+	else
+		self:_stepSlide(dt, humanoid, root)
+	end
+end
+
+function Movement:_stepSlide(dt: number, humanoid: Humanoid, root: BasePart)
+	local target = Vector3.zero
+	if self.enabled.Speed then
+		target = humanoid.MoveDirection * self.values.Speed
+	end
+
+	local alpha = 1 - math.exp(-SLIDE_SMOOTHING * dt)
+	self._slide = self._slide:Lerp(target, alpha)
+
+	if self._slide.Magnitude > 0.01 then
+		root.CFrame += self._slide * dt
+	end
+end
+
+function Movement:_readFlightInput(camera: Camera, humanoid: Humanoid): Vector3
+	if UserInputService:GetFocusedTextBox() then
+		return Vector3.zero
+	end
+
+	local cf = camera.CFrame
+	local v = Vector3.zero
+	if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+		v += cf.LookVector
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+		v -= cf.LookVector
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+		v += cf.RightVector
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+		v -= cf.RightVector
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+		v += Vector3.yAxis
+	end
+	if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+		v -= Vector3.yAxis
+	end
+
+	if v.Magnitude < 1e-4 and humanoid.MoveDirection.Magnitude > 0 then
+		v = humanoid.MoveDirection
+	end
+	return v
+end
+
+function Movement:_startFlight()
+	local humanoid, root = self.humanoid, self.root
+	if self._flyObjects or not humanoid or not root then
+		return
+	end
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "DbgFlyAttachment"
+	attachment.Parent = root
+
+	local velocity = Instance.new("LinearVelocity")
+	velocity.Name = "DbgFlyVelocity"
+	velocity.Attachment0 = attachment
+	velocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	velocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+	velocity.MaxForce = math.huge
+	velocity.VectorVelocity = Vector3.zero
+	velocity.Parent = root
+
+	local align = Instance.new("AlignOrientation")
+	align.Name = "DbgFlyAlign"
+	align.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	align.Attachment0 = attachment
+	align.RigidityEnabled = false
+	align.MaxTorque = math.huge
+	align.Responsiveness = 25
+	align.CFrame = root.CFrame.Rotation
+	align.Parent = root
+
+	self._flyObjects = { attachment = attachment, velocity = velocity, align = align }
+	self._flyVelocity = Vector3.zero
+
+	self._prevAutoRotate = humanoid.AutoRotate
+	humanoid.AutoRotate = false
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+	humanoid:ChangeState(Enum.HumanoidStateType.Running)
+end
+
+function Movement:_stepFlight(dt: number, humanoid: Humanoid)
+	local objects = self._flyObjects
+	local camera = workspace.CurrentCamera
+	if not objects or not camera then
+		return
+	end
+
+	local input = self:_readFlightInput(camera, humanoid)
+	local target = Vector3.zero
+	if input.Magnitude > 1e-4 then
+		target = input.Unit * self.values.Fly
+	end
+
+	local alpha = 1 - math.exp(-FLY_SMOOTHING * dt)
+	self._flyVelocity = self._flyVelocity:Lerp(target, alpha)
+	objects.velocity.VectorVelocity = self._flyVelocity
+
+	local look = camera.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if flat.Magnitude > 0.01 then
+		objects.align.CFrame = CFrame.lookAt(Vector3.zero, flat)
+	end
+
+	if humanoid:GetState() ~= Enum.HumanoidStateType.Running then
+		humanoid:ChangeState(Enum.HumanoidStateType.Running)
+	end
+end
+
+function Movement:_stopFlight()
+	local objects = self._flyObjects
+	if not objects then
+		return
+	end
+	self._flyObjects = nil
+	self._flyVelocity = Vector3.zero
+
+	objects.velocity:Destroy()
+	objects.align:Destroy()
+	objects.attachment:Destroy()
+
+	local humanoid = self.humanoid
+	if humanoid and humanoid.Parent then
+		humanoid.AutoRotate = self._prevAutoRotate
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+		humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+	end
+end
+
+function Movement:_applyNoclip()
+	local character = self.character
+	if not self.enabled.Noclip or not character then
+		return
+	end
+	for _, part in character:GetDescendants() do
+		if part:IsA("BasePart") then
+			if self._originalCollide[part] == nil then
+				self._originalCollide[part] = part.CanCollide
+			end
+			part.CanCollide = false
+		end
+	end
+end
+
+function Movement:_restoreCollisions()
+	for part, original in self._originalCollide do
+		if part.Parent then
+			part.CanCollide = original
+		end
+	end
+	table.clear(self._originalCollide)
+end
+
+return Movement
